@@ -1,0 +1,30 @@
+# Starting allow-list of system metrics. Names differ slightly between releases:
+# check them against V$METRICNAME (group 2) before the first run.
+metrics:
+  - Average Active Sessions
+  - Database Time Per Sec
+  - CPU Usage Per Sec
+  - Host CPU Utilization (%)
+  - Database CPU Time Ratio
+  - Database Wait Time Ratio
+  - Executions Per Sec
+  - User Transaction Per Sec
+  - Logical Reads Per Sec
+  - Hard Parse Count Per Sec
+  - Redo Generated Per Sec
+  - Current Logons Count
+  - Session Count
+  - Physical Read Total IO Requests Per Sec
+  - Physical Write Total IO Requests Per Sec
+  - Physical Read Total Bytes Per Sec
+  - Physical Write Total Bytes Per Sec
+  - Average Synchronous Single-Block Read Latency
+  - SQL Service Response Time
+  - Response Time Per Txn
+  - Network Traffic Volume Per Sec
+  - Enqueue Timeouts Per Sec
+  # RAC
+  - Global Cache Average CR Get Time
+  - Global Cache Average Current Get Time
+  - GC CR Block Received Per Second
+  - GC Current Block Received Per Second

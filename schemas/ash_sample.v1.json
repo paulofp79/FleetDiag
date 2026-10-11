@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ash_sample.v1",
+  "description": "One Active Session History row. Topic: ora.ash.raw.v1. Only produced in diag-pack mode. SQL text is never included, only the SQL_ID.",
+  "type": "object",
+  "required": ["schema", "fleet", "db_unique_name", "inst_id", "sample_time", "session_id", "session_state"],
+  "properties": {
+    "schema": { "const": "ash_sample.v1" },
+    "fleet": { "type": "string" },
+    "db_unique_name": { "type": "string" },
+    "inst_id": { "type": "integer", "minimum": 1 },
+    "sample_time": { "type": "string", "format": "date-time" },
+    "session_id": { "type": "integer" },
+    "session_serial": { "type": "integer" },
+    "session_state": { "enum": ["ON CPU", "WAITING"] },
+    "sql_id": { "type": ["string", "null"] },
+    "event": { "type": ["string", "null"] },
+    "wait_class": { "type": ["string", "null"] },
+    "blocking_session": { "type": ["integer", "null"] },
+    "blocking_inst_id": { "type": ["integer", "null"] },
+    "module": { "type": ["string", "null"] },
+    "collector_id": { "type": "string" }
+  },
+  "additionalProperties": false
+}

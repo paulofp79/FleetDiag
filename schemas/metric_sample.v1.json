@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "metric_sample.v1",
+  "description": "One system metric value for one instance over one collection interval. Topic: ora.metric.raw.v1",
+  "type": "object",
+  "required": ["schema", "fleet", "db_unique_name", "inst_id", "metric_name", "value", "begin_time", "end_time", "collected_at"],
+  "properties": {
+    "schema": { "const": "metric_sample.v1" },
+    "fleet": { "type": "string" },
+    "db_unique_name": { "type": "string" },
+    "inst_id": { "type": "integer", "minimum": 1 },
+    "metric_name": { "type": "string" },
+    "metric_unit": { "type": "string" },
+    "value": { "type": "number" },
+    "begin_time": { "type": "string", "format": "date-time" },
+    "end_time": { "type": "string", "format": "date-time" },
+    "collected_at": { "type": "string", "format": "date-time" },
+    "collector_id": { "type": "string" }
+  },
+  "additionalProperties": false
+}
