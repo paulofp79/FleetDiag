@@ -43,7 +43,13 @@ This is the part nobody else will have.
 - [x] Flink containers (Apple Silicon fix) and 5 minute rollup job, verified against SQL
 - [x] Rollup sink into fd_metric_rollup (bucket_sec = 300)
 - [x] Collector stall fix and Oracle restart test
-- [ ] Make the Flink job restartable (checkpoints, resubmit script)
-- [ ] 1 hour rollup
-- [ ] Spark seasonal baseline job (fd_baseline)
-- [ ] Flink scoring against baselines (fd_anomaly)
+- [x] Spark environment: separate venv, ojdbc jar, read fd_metric_rollup over JDBC (spark/read_check.py)
+- [ ] Spark baseline job: median/MAD per series per hour-of-week (168 slots) into fd_baseline,
+      with min_samples per slot and EWMA fallback for slots without enough data
+- [ ] Baseline topic (ora.baseline.v1) and JSON schema in schemas/
+- [ ] Make the Flink job restartable (checkpoints, resubmit script that checks for a running job)
+- [ ] Flink scoring: robust z-score vs baseline (EWMA fallback) to ora.anomaly.v1
+- [ ] Anomaly sink into fd_anomaly
+- [ ] 1 hour rollup (low priority)
+- [ ] Exit test: injected load spike flagged within 3 minutes
+- [ ] Exit test: false positives counted over a week on a quiet database
