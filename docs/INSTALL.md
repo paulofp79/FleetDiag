@@ -8,10 +8,10 @@ Written on 2026-10-11 on macOS with Apple Silicon (arm64) and Docker Desktop. Co
 | Kafka container | verified: broker starts, port 9092 reachable from the host |
 | Kafka topics and smoke test | commands below, not yet confirmed |
 | Oracle Free container | verified: starts, version banner returned |
-| `gv$sysmetric` check | pending: confirm `group_id` for 60 s metrics |
-| Python environment | commands below, not yet confirmed |
+| Metric source | verified: in a PDB use `gv$con_sysmetric` group 18 (section 6) |
+| Python environment | verified (Python 3.13.3) |
 | Schema in the local Oracle | verified: 7 tables, 4 views, no invalid objects |
-| Collector | written; first run and Kafka check pending |
+| Collector | verified: runs in the background and publishes to Kafka |
 
 ## Prerequisites
 
@@ -142,7 +142,7 @@ SELECT group_id, inst_id, metric_name, ROUND(value,3) AS value FROM gv$sysmetric
 SQL
 ```
 
-Seen so far: `Oracle AI Database 26ai Free Release 23.26.3.0.0`. The collector assumes 60-second metrics are `group_id = 2`. That is still to be confirmed from the second query.
+Seen: `Oracle AI Database 26ai Free Release 23.26.3.0.0`. In `FREEPDB1` the two `gv$sysmetric` queries above return no rows. That is expected in a pluggable database; the metrics are in `gv$con_sysmetric` (see section 6).
 
 ### Oracle troubleshooting
 
@@ -202,15 +202,39 @@ Seen on 2026-10-11: INDEX 34, INDEX PARTITION 4, LOB 15, LOB PARTITION 2, SEQUEN
 
 ## 6. Collector (M0)
 
-`collector/collector.py` reads the 60-second system metrics from `GV$SYSMETRIC` every 15 seconds and publishes one JSON event per metric per interval to `ora.metric.raw.v1`.
+`collector/collector.py` reads the 60-second system metrics every 15 seconds and publishes one JSON event per metric per interval to `ora.metric.raw.v1`.
 
 - Only metrics in `collector/config/metrics.yaml` are published.
 - Events are validated against `schemas/metric_sample.v1.json` before sending.
-- A value already published for the same interval is skipped. The state is in memory, so a restart can resend one interval. The sink will be idempotent.
+- A value already published for the same interval is skipped. The state is in memory, so a restart can resend one interval. The sink is idempotent.
 - Database times are converted to UTC using the offset between `SYSDATE` and the UTC time.
-- It warns if the query returns no rows (check `group_id` in `collector/queries/sysmetric_60s.sql`) and lists allow-listed metrics that don't exist in the database.
 
-Settings come from environment variables:
+### Metric source: root container vs pluggable database
+
+On startup the collector picks the source that has data:
+
+| Where | View | Group |
+|---|---|---|
+| Non-CDB or root container | `gv$sysmetric` | 2, "System Metrics Long Duration" (60 s) |
+| Pluggable database (`FREEPDB1`, and Autonomous Database is also a PDB) | `gv$con_sysmetric` | 18, "PDB System Metrics Long Duration" (60 s) |
+
+In `FREEPDB1`, `v$sysmetric` is empty and `v$con_sysmetric` has 150 rows in group 18. The root container has groups 2 and 3 in `v$sysmetric`. Autonomous Database has not been tested yet.
+
+Grant needed for the PDB source (run as `SYSDBA`):
+
+```bash
+cd deploy
+docker compose exec -T oracle-source sqlplus -s / as sysdba <<'SQL'
+ALTER SESSION SET CONTAINER = FREEPDB1;
+GRANT SELECT ON sys.gv_$con_sysmetric TO fleetdiag;
+SQL
+```
+
+Two allow-listed metrics do not exist at PDB level and were removed from `metrics.yaml`: `Average Synchronous Single-Block Read Latency` and `Host CPU Utilization (%)`. That leaves 24 metrics per interval.
+
+### Settings
+
+Environment variables:
 
 | Variable | Default |
 |---|---|
@@ -222,32 +246,69 @@ Settings come from environment variables:
 | `FLEET` / `DB_UNIQUE_NAME` | `local` / `FREE` |
 | `POLL_SEC` | `15` |
 
-Run it (the venv from section 4 must exist):
+### Running it
+
+The venv from section 4 must exist. The `export` reads the password from `deploy/.env` into the current terminal only; the background process inherits it.
 
 ```bash
 cd "$HOME/Documents/ClaudeCode/FleetDiag"
 source collector/.venv/bin/activate
 export ORACLE_PASSWORD="$(grep ORACLE_SOURCE_PWD deploy/.env | cut -d= -f2)"
-python collector/collector.py
+
+python collector/collector.py start     # background; prints the tail command
+tail -f collector/run/collector.log     # follow the log; Ctrl+C leaves the collector running
+python collector/collector.py status
+python collector/collector.py stop
+python collector/collector.py run       # foreground, stop with Ctrl+C
 ```
 
-The `export` reads the password from `deploy/.env` into the current terminal only. Stop the collector with Ctrl+C.
+The log is `collector/run/collector.log` and the process ID is in `collector/run/collector.pid`. The log grows without limit for now. Do not start a second collector while one is running, or events will be published twice.
 
-Check the messages in Kafka (second terminal):
+### Example output
+
+Collector log, first minutes after `start` (2026-10-11):
+
+```
+2026-10-11 14:55:02,435 INFO connected to localhost:1521/FREEPDB1 as fleetdiag
+2026-10-11 14:55:02,437 INFO metric source: gv$con_sysmetric group 18 (pluggable database)
+2026-10-11 14:55:02,439 WARNING allow-listed metrics not found in this database: ['Average Synchronous Single-Block Read Latency', 'Host CPU Utilization (%)']
+2026-10-11 14:55:02,474 INFO rows=150 published=24
+2026-10-11 14:55:17,449 INFO rows=150 published=0
+2026-10-11 14:55:32,453 INFO rows=150 published=0
+2026-10-11 14:55:47,466 INFO rows=150 published=24
+```
+
+How to read it: the view returns 150 rows each poll. `published=24` appears about once a minute, when a new 60-second interval is available, and `published=0` means those values were already sent. The WARNING is from before the two metrics were removed from `metrics.yaml`.
+
+Three messages from Kafka:
 
 ```bash
 cd deploy
 docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:19092 --topic ora.metric.raw.v1 --from-beginning --max-messages 3 --timeout-ms 15000
-docker compose exec -T kafka /opt/kafka/bin/kafka-run-class.sh kafka.tools.GetOffsetShell --bootstrap-server kafka:19092 --topic ora.metric.raw.v1
 ```
 
-Status: the first run and the Kafka check have not been confirmed yet.
+```
+Picked up JAVA_TOOL_OPTIONS: -XX:UseSVE=0
+{"schema": "metric_sample.v1", "fleet": "local", "db_unique_name": "FREE", "inst_id": 1, "metric_name": "Session Count", "metric_unit": "Sessions", "value": 1.0, "begin_time": "2026-10-11T17:52:31Z", "end_time": "2026-10-11T17:53:32Z", "collected_at": "2026-10-11T17:54:29Z", "collector_id": "collector-1"}
+{"schema": "metric_sample.v1", "fleet": "local", "db_unique_name": "FREE", "inst_id": 1, "metric_name": "Average Active Sessions", "metric_unit": "Active Sessions", "value": 5.41334661354582e-05, "begin_time": "2026-10-11T17:52:31Z", "end_time": "2026-10-11T17:53:32Z", "collected_at": "2026-10-11T17:54:29Z", "collector_id": "collector-1"}
+{"schema": "metric_sample.v1", "fleet": "local", "db_unique_name": "FREE", "inst_id": 1, "metric_name": "CPU Usage Per Sec", "metric_unit": "CentiSeconds Per Second", "value": 0.00593127490039841, "begin_time": "2026-10-11T17:52:31Z", "end_time": "2026-10-11T17:53:32Z", "collected_at": "2026-10-11T17:54:29Z", "collector_id": "collector-1"}
+Processed a total of 3 messages
+```
+
+The first line comes from the Kafka tool inside the container and is harmless. All times are UTC. 14:55 in Rio is 17:55Z, so the conversion is right. An interval runs about 61 seconds, for example 17:52:31Z to 17:53:32Z.
+
+Total messages on the topic:
+
+```bash
+docker compose exec -T kafka /opt/kafka/bin/kafka-run-class.sh kafka.tools.GetOffsetShell --bootstrap-server kafka:19092 --topic ora.metric.raw.v1
+```
 
 ### Collector troubleshooting
 
 - **`source: no such file or directory: collector/.venv/bin/activate`.** The venv was never created. Do section 4 first.
-- **"query returned no rows".** The `group_id` for 60-second metrics differs. List the groups with `SELECT group_id, COUNT(*) FROM gv$sysmetric GROUP BY group_id` as `fleetdiag` and update `queries/sysmetric_60s.sql`.
-- **"allow-listed metrics not found".** Metric names vary by release. Trim `config/metrics.yaml` to names present in `V$METRICNAME`.
+- **"query returned no rows".** Neither source has data. Run the diagnostics as `SYSDBA`: `SELECT group_id, COUNT(*) FROM v$sysmetric GROUP BY group_id;` and the same on `v$con_sysmetric`, inside the PDB (`ALTER SESSION SET CONTAINER = FREEPDB1;`). `ORA-00942` on `gv$con_sysmetric` means the grant above is missing.
+- **"allow-listed metrics not found".** Metric names vary by release and by container level. Remove the listed names from `config/metrics.yaml`.
+- **`start` says the collector exited right away.** Read the last lines of `collector/run/collector.log`.
 
 ## 7. Generating test load
 
@@ -277,6 +338,8 @@ Swingbench is a good next step for a realistic OLTP load. Limits of the Free con
 
 ## Next
 
-1. Confirm the collector run and the Kafka messages.
-2. Write the sink: consume `ora.metric.raw.v1` and MERGE into `fd_metric_rollup` (M0 only; Flink takes over the rollup in M1).
-3. Add Flink containers (expect to need `JAVA_TOOL_OPTIONS` there too).
+1. Sink: `sink/sink.py` consumes `ora.metric.raw.v1` and MERGEs into `fd_metric_rollup` (M0 only; Flink takes over the rollup in M1). Written, first run pending.
+2. Replay test: reset the sink's consumer group to the earliest offset and check that the row count does not change.
+3. Run the load test from section 7 and check that the values show up in `fd_metric_rollup`.
+4. M0 exit check: one metric flowing for 24 hours with no gaps and no duplicates, including after restarting each component.
+5. Add Flink containers (expect to need `JAVA_TOOL_OPTIONS` there too) for M1.
