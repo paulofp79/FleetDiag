@@ -14,7 +14,7 @@ Written on 2026-10-11 on macOS with Apple Silicon (arm64) and Docker Desktop. Co
 ## Prerequisites
 
 - Docker Desktop (or OrbStack/Colima), running
-- Python 3.11 or newer
+- Python 3.11 or newer. Tested with Python 3.13.3 (`python3 --version`). Use whichever version you have, and adjust the commands below if your executable has a different name (for example `python3.12` from Homebrew or pyenv)
 - git, and an SSH key registered with GitHub (`ssh -T git@github.com` greets you by username)
 
 ## 1. Git repository and GitHub
@@ -150,12 +150,14 @@ Seen so far: `Oracle AI Database 26ai Free Release 23.26.3.0.0`. The collector a
 
 ## 4. Python environment (collector)
 
+The commands use the `python3` on your PATH. This was written with Python 3.13.3. If your version differs, use your own executable in the `venv` line. Packages are listed in `collector/requirements.txt`, so a very new or very old Python may need different package versions. Check the `pip install` output.
+
 ```bash
 cd "$HOME/Documents/ClaudeCode/FleetDiag"
 python3 -m venv collector/.venv
 source collector/.venv/bin/activate
 pip install --upgrade pip
-pip install oracledb confluent-kafka pyyaml jsonschema
+pip install -r collector/requirements.txt
 python -c "import oracledb, confluent_kafka; print('oracledb', oracledb.__version__, '| confluent-kafka', confluent_kafka.version()[0])"
 ```
 

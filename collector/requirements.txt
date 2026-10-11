@@ -1,0 +1,4 @@
+oracledb
+confluent-kafka
+pyyaml
+jsonschema
