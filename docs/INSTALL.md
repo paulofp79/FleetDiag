@@ -476,3 +476,162 @@ component was deliberately stopped.
 | Sink log shows no new "sink started" | Check `sink/run/sink.err` and that `ORACLE_PASSWORD` is exported in the same shell. |
 | Replay test "passes" instantly | Kafka commands failed silently (zsh word splitting, see above). Check that `--describe` printed a table. |
 | `ORA-01031` granting SYS views | Connect as SYSDBA inside the PDB (`alter session set container = FREEPDB1`). |
+
+### Restart test results
+
+Each component was stopped and restarted on the reference run, one at a time:
+
+| Component | Effect in the data | Result |
+|---|---|---|
+| Sink | none; it caught up with `messages=48` (two buffered intervals) | no gap, no duplicate |
+| Kafka | none | no gap, no duplicate |
+| Collector | gap of about 3 min (18:30:32 to 18:33:32 UTC) | expected |
+| Oracle | gap of about 2 min (18:35:32 to 18:37:31 UTC) | expected |
+
+Row count after the tests was 1008, which is 42 intervals x 24 metrics, so no interval was
+partial or duplicated.
+
+Known limitation: the collector reads only the current 60 s interval. While it is stopped
+(or Oracle is down) those intervals are lost. Backfill from `gv$con_sysmetric_history` is
+planned for M1.
+
+### Why a 24 h run
+
+The short tests prove replay and restart behaviour. The 24 h run covers what they cannot:
+slow failures (leaks, idle connection timeouts, a stalled consumer), the daily partition
+rollover of `fd_metric_rollup` at 00:00 UTC, and one continuous day of history, which the
+M1 seasonal baselines need. The expected result is 1440 intervals x 24 metrics = 34,560
+rows with no gaps and no near-duplicates.
+
+~~~bash
+nohup caffeinate -dimsu >/dev/null 2>&1 &         # keep the Mac awake, plugged in, lid open
+date -u +"%Y-%m-%d %H:%M:%S" | tee sink/run/m0_start.txt
+~~~
+
+After 24 h:
+
+~~~bash
+export ORACLE_PASSWORD="$(grep ORACLE_SOURCE_PWD deploy/.env | cut -d= -f2)"
+./scripts/m0_check.sh        # counts only rows after the start time in m0_start.txt
+~~~
+
+Pass criteria: no gaps over 90 s, no near-duplicates under 30 s, equal row counts per
+metric. Do not restart anything during the window.
+
+## Collector stall and self-recovery
+
+Incident on the reference run: after restarting Oracle, the collector was restarted while the
+PDB view `gv$con_sysmetric` was still empty (Oracle needs about a minute to repopulate its
+metrics). The collector chooses its query view at startup, fell back to the empty root view
+`gv$sysmetric`, and published nothing for about 40 minutes while its status still said
+"running". The Kafka end offset stopped moving and no new rows reached Oracle.
+
+Fix in `collector.py`: when a poll returns no rows it re-runs `pick_query` (so it switches to
+the right view as soon as data exists) and logs `ERROR STALL: N consecutive empty polls` once
+per minute while the stall lasts. Search the log for it:
+
+~~~bash
+grep -E "STALL|no rows|query failed|metric source" collector/run/collector.log | tail
+~~~
+
+### Oracle restart test
+
+~~~bash
+docker restart oracle-source
+# the image has no health check; wait for the PDB open message instead
+until docker logs --since 3m oracle-source 2>&1 | grep -q "Pluggable database FREEPDB1 opened read write"; do sleep 5; done; echo ready
+sleep 150
+grep -E "no rows|STALL|query failed|metric source|published=24" collector/run/collector.log | tail -12
+tail -3 sink/run/sink.log
+tail -3 sink/run/rollup_sink.log
+~~~
+
+Result: the collector logged `no rows` for about 45 s, raised one `STALL` error, re-picked
+`gv$con_sysmetric group 18` and returned to `published=24` without a manual restart. The sink
+resumed with `messages=24`. The rollup sink logged `DPY-4011 ... Broken pipe`, rewound the
+batch, reconnected and merged again.
+
+Operational rule: a collector that is running but publishing zero rows is a failure. Alert on
+`STALL` in the log, or on a flat Kafka end offset:
+
+~~~bash
+docker compose -f deploy/docker-compose.yml exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server kafka:19092 --topic ora.metric.raw.v1
+~~~
+
+## Flink (M1): 5-minute rollup
+
+Flink runs from a second compose file that adds the Apple Silicon JVM fix
+(`JAVA_TOOL_OPTIONS=-XX:UseSVE=0`) and mounts `flink/extra` (connector jars) and `flink/sql`.
+
+~~~bash
+./scripts/get-flink-jars.sh                      # Kafka SQL connector, not stored in git
+dcf() { docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.flink.yml "$@"; }
+dcf up -d flink-jobmanager flink-taskmanager
+sleep 15
+dcf ps
+curl -s localhost:8081/overview; echo            # expect 1 taskmanager, 4 slots
+~~~
+
+Use a shell function for `dcf`. A variable holding the command does not work in zsh.
+
+Submit the job (`flink/sql/rollup_5m.sql`):
+
+~~~bash
+dcf exec -T flink-jobmanager ./bin/sql-client.sh -l /opt/flink/extra -f /opt/flink/sql/rollup_5m.sql
+curl -s localhost:8081/jobs/overview | python3 -m json.tool | grep -E '"name"|"state"'
+~~~
+
+Submitting twice creates a second identical job and every bucket is published twice. List the
+jobs first and cancel the newer one if needed:
+
+~~~bash
+curl -s -X PATCH "localhost:8081/jobs/<JOB_ID>?mode=cancel"
+~~~
+
+The job reads `ora.metric.raw.v1` from the earliest offset, uses `end_time` as event time with
+a 2 minute watermark, and writes tumbling 5 minute windows to `ora.metric.rollup.v1`.
+A window is emitted only after the watermark passes its end, so the newest bucket appears
+about 7 minutes after it starts. Example output message:
+
+~~~
+{"fleet":"local","db_unique_name":"FREE","inst_id":1,"metric_name":"Session Count","bucket_sec":300,"bucket_ts":"2026-10-11T17:50:00Z","val_avg":1.0,"val_min":1.0,"val_max":1.0,"sample_cnt":3}
+~~~
+
+`sample_cnt` is 5 for a full window. The first window after a start is partial.
+
+Limitation: the job has no checkpointing or HA. If the Flink containers restart, the job is
+lost and must be resubmitted.
+
+## Rollup sink
+
+`sink/rollup_sink.py` writes `ora.metric.rollup.v1` into `fd_metric_rollup` with the bucket size
+from the message (300). Same MERGE pattern and offset handling as `sink.py`, consumer group
+`fleetdiag-adb-rollup-sink`.
+
+~~~bash
+source collector/.venv/bin/activate
+export ORACLE_PASSWORD="$(grep ORACLE_SOURCE_PWD deploy/.env | cut -d= -f2)"
+python sink/rollup_sink.py start      # also: stop | status
+tail -f sink/run/rollup_sink.log
+~~~
+
+Verify that Flink's averages match plain SQL over the 60 s rows of the same window:
+
+~~~bash
+q <<'SQL'
+select r.bucket_ts, r.sample_cnt, r.val_avg flink_avg,
+       (select avg(m.val_avg) from fd_metric_rollup m
+         where m.bucket_sec = 60 and m.db_id = r.db_id and m.inst_id = r.inst_id
+           and m.metric_name = r.metric_name
+           and m.bucket_ts >= r.bucket_ts and m.bucket_ts < r.bucket_ts + interval '5' minute) sql_avg
+from fd_metric_rollup r
+where r.bucket_sec = 300 and r.metric_name = 'Redo Generated Per Sec'
+order by r.bucket_ts desc fetch first 6 rows only;
+SQL
+~~~
+
+Result on the reference run: values equal in every full window.
+
+Note: any query over `fd_metric_rollup` that checks gaps or duplicates must filter on
+`bucket_sec`, otherwise 60 s and 300 s rows mix. `scripts/m0_check.sh` already does.

@@ -35,5 +35,15 @@ This is the part nobody else will have.
 - [x] Collector (PDB metrics, 24 metrics per interval) publishing to Kafka
 - [x] Sink with idempotent MERGE, manual offset commits
 - [x] Replay test passed (936 messages replayed, row count unchanged)
-- [ ] Component restart tests (sink, collector, Kafka, Oracle)
+- [x] Component restart tests (sink, collector, Kafka, Oracle)
 - [ ] 24 h run with zero gaps and zero duplicates
+
+## M1 progress
+
+- [x] Flink containers (Apple Silicon fix) and 5 minute rollup job, verified against SQL
+- [x] Rollup sink into fd_metric_rollup (bucket_sec = 300)
+- [x] Collector stall fix and Oracle restart test
+- [ ] Make the Flink job restartable (checkpoints, resubmit script)
+- [ ] 1 hour rollup
+- [ ] Spark seasonal baseline job (fd_baseline)
+- [ ] Flink scoring against baselines (fd_anomaly)

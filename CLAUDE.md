@@ -38,8 +38,8 @@ docs/ROADMAP.md, docs/INSTALL.md. Read them before changing design.
 
 ## Status (2026-10-11)
 - M0 walking skeleton: collector, Kafka, sink work. Replay test passed (936 messages replayed, 912 rows, no duplicates). Restart tests passed for sink, Kafka, collector, Oracle (collector/Oracle restarts leave expected gaps; collector does not backfill).
-- BUG (open): the collector picks its query view once at startup. After an Oracle restart the PDB view was still empty, so it fell back to the empty root view and published nothing for ~40 min while still "running". Fix needed: re-run pick_query when a poll returns no rows (try/except oracledb.Error), and log ERROR / exit after N consecutive empty polls so a silent stall cannot happen.
-- The 24 h M0 run is NOT valid yet. Restart it after the collector fix: write start time with `date -u +"%Y-%m-%d %H:%M:%S" | tee sink/run/m0_start.txt`, keep the Mac awake (nohup caffeinate -dimsu), then run scripts/m0_check.sh (filters bucket_sec = 60). Pass: no gaps over 90 s, no near-duplicates under 30 s, equal rows per metric.
+- BUG (fixed 2026-10-11: collector re-picks view on empty poll and logs STALL): the collector picks its query view once at startup. After an Oracle restart the PDB view was still empty, so it fell back to the empty root view and published nothing for ~40 min while still "running". Fix needed: re-run pick_query when a poll returns no rows (try/except oracledb.Error), and log ERROR / exit after N consecutive empty polls so a silent stall cannot happen.
+- The 24 h M0 run was restarted after the fix; start time is the last line of sink/run/m0_start.txt. Restart it after the collector fix: write start time with `date -u +"%Y-%m-%d %H:%M:%S" | tee sink/run/m0_start.txt`, keep the Mac awake (nohup caffeinate -dimsu), then run scripts/m0_check.sh (filters bucket_sec = 60). Pass: no gaps over 90 s, no near-duplicates under 30 s, equal rows per metric.
 - M1 step 1 done: Flink 5-min rollup job verified (Flink avg equals SQL average of 60 s rows). rollup_sink.py writes bucket_sec=300 rows.
 
 ## Next

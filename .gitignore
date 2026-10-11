@@ -13,3 +13,4 @@ ewallet.p12
 ewallet.pem
 collector/run/
 sink/run/
+flink/extra/*.jar

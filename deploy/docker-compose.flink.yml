@@ -1,0 +1,12 @@
+services:
+  flink-jobmanager:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:UseSVE=0"
+    volumes:
+      - ../flink/extra:/opt/flink/extra
+      - ../flink/sql:/opt/flink/sql
+  flink-taskmanager:
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:UseSVE=0"
+    volumes:
+      - ../flink/extra:/opt/flink/extra
