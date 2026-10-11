@@ -92,6 +92,7 @@ def main():
     log.info("metric source: %s", source)
     seen = {}  # (inst_id, metric_name) -> end_time already published
     first_cycle = True
+    empty_polls = 0
 
     while not stop.is_set() and conn is not None:
         started = time.monotonic()
@@ -113,7 +114,17 @@ def main():
             continue
 
         if not rows:
-            log.warning("query returned no rows; check group_id in collector/queries/sysmetric_60s.sql")
+            empty_polls += 1
+            log.warning("query returned no rows (%d in a row); re-checking metric source", empty_polls)
+            try:
+                sql, source = pick_query(conn)
+                log.info("metric source: %s", source)
+            except oracledb.Error as exc:
+                log.error("pick_query failed: %s", exc)
+            if empty_polls % 4 == 0:
+                log.error("STALL: %d consecutive empty polls, nothing is being published", empty_polls)
+        else:
+            empty_polls = 0
         if first_cycle and rows:
             names = {r[1] for r in rows}
             missing = sorted(ALLOW - names)
