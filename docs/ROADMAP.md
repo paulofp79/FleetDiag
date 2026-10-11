@@ -28,3 +28,12 @@ This is the part nobody else will have.
 - Synthetic generator for 3,500 databases and a load test against the sizing assumptions.
 - Per-fleet visibility, deployment scripts for OCI, documentation, first public release.
 - **Exit:** sustained ingest at the target rate with sink lag under one minute.
+
+## M0 progress
+
+- [x] Kafka, local Oracle, schema loaded
+- [x] Collector (PDB metrics, 24 metrics per interval) publishing to Kafka
+- [x] Sink with idempotent MERGE, manual offset commits
+- [x] Replay test passed (936 messages replayed, row count unchanged)
+- [ ] Component restart tests (sink, collector, Kafka, Oracle)
+- [ ] 24 h run with zero gaps and zero duplicates

@@ -343,3 +343,136 @@ Swingbench is a good next step for a realistic OLTP load. Limits of the Free con
 3. Run the load test from section 7 and check that the values show up in `fd_metric_rollup`.
 4. M0 exit check: one metric flowing for 24 hours with no gaps and no duplicates, including after restarting each component.
 5. Add Flink containers (expect to need `JAVA_TOOL_OPTIONS` there too) for M1.
+
+## Sink (Kafka to Oracle)
+
+The sink reads `ora.metric.raw.v1` and writes to `fd_metric_rollup` with an idempotent MERGE.
+Kafka offsets are committed only after the database commit, so a crash or restart replays
+messages but never creates duplicates. If the database fails, the sink rewinds to the first
+offset of the batch and reconnects.
+
+Design notes:
+- Consumer group `fleetdiag-adb-sink`, manual commits, `auto.offset.reset=earliest`.
+- Rows are keyed on the exact `end_time` of the collection interval. Oracle intervals are
+  slightly longer than 60 s (for example 17:52:31 to 17:53:32), so truncating to the minute
+  would create false gaps and collisions.
+- Databases are registered in `fd_database` on first sight (platform from env `PLATFORM`,
+  default `OTHER`).
+- Invalid messages are logged and counted as `bad`; they never block the batch.
+
+### Install and run
+
+~~~bash
+cd FleetDiag
+source collector/.venv/bin/activate        # same venv as the collector
+export ORACLE_PASSWORD="$(grep ORACLE_SOURCE_PWD deploy/.env | cut -d= -f2)"
+python sink/sink.py start                  # runs in the background
+tail -f sink/run/sink.log
+python sink/sink.py status
+python sink/sink.py stop
+~~~
+
+Runtime files are in `sink/run/` (`sink.pid`, `sink.log`, `sink.err`) and are gitignored.
+
+Example log (first start drains the backlog, then one batch of 24 per interval):
+
+~~~
+INFO sink started topic=ora.metric.raw.v1 group=fleetdiag-adb-sink dsn=localhost:1521/FREEPDB1
+INFO messages=500 merged=500 bad=0
+INFO messages=388 merged=388 bad=0
+INFO messages=24 merged=24 bad=0
+~~~
+
+### Verify the data
+
+~~~bash
+q() { docker exec -i oracle-source sqlplus -s fleetdiag/"$ORACLE_PASSWORD"@localhost:1521/FREEPDB1; }
+q <<'SQL'
+select count(*) rows_total, count(distinct metric_name) metrics,
+       min(bucket_ts) first_ts, max(bucket_ts) last_ts from fd_metric_rollup;
+SQL
+~~~
+
+Expect 24 metrics and `last_ts` moving forward every minute.
+
+## M0 tests
+
+### Replay test (idempotency)
+
+Stop the collector, let the sink reach lag 0, count rows, rewind the consumer group to the
+beginning, restart the sink, and count again. The counts must be identical.
+
+~~~bash
+kcg() { docker compose -f deploy/docker-compose.yml exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:19092 --group fleetdiag-adb-sink "$@"; }
+
+python collector/collector.py stop
+kcg --describe                                   # LAG must be 0
+q <<'SQL' | tee /tmp/before.txt
+select count(*) from fd_metric_rollup;
+SQL
+python sink/sink.py stop
+kcg --topic ora.metric.raw.v1 --reset-offsets --to-earliest --execute
+python sink/sink.py start; sleep 30
+tail -6 sink/run/sink.log                        # the whole topic is merged again
+q <<'SQL' | tee /tmp/after.txt
+select count(*) from fd_metric_rollup;
+SQL
+diff /tmp/before.txt /tmp/after.txt && echo "REPLAY OK"
+python collector/collector.py start
+~~~
+
+Result on the reference run: 936 messages replayed (500 + 436), table stayed at 912 rows.
+The 24-message difference is one interval that the collector published twice around a
+restart; the MERGE collapsed it.
+
+Warning for zsh (macOS default shell): do not store the command in a variable such as
+`DC="docker compose ..."` and call `$DC`. zsh does not split it into words and the command
+fails with "no such file or directory", which makes the test look like it passed without
+running. Use a shell function (`kcg` above).
+
+### Component restart tests
+
+Wait about 3 minutes between steps and check that the sink log resumes and the row count
+grows by 24 per minute.
+
+~~~bash
+python sink/sink.py stop; sleep 90; python sink/sink.py start
+python collector/collector.py stop; sleep 90; python collector/collector.py start
+docker compose -f deploy/docker-compose.yml restart kafka
+docker restart oracle-source        # wait for "healthy" in docker ps, then restart sink and collector
+~~~
+
+A 90 s collector stop can leave one missing interval; this is expected.
+
+### 24 h run and exit check
+
+~~~bash
+caffeinate -dimsu &                 # keep the Mac awake
+~~~
+
+After 24 h:
+
+~~~bash
+q <<'SQL'
+set linesize 200 pagesize 100
+select metric_name, count(*) gaps from (
+  select metric_name, bucket_ts - lag(bucket_ts) over (partition by db_id,inst_id,metric_name order by bucket_ts) d
+  from fd_metric_rollup) where d > interval '90' second group by metric_name;
+select metric_name, count(*) dups from (
+  select metric_name, bucket_ts - lag(bucket_ts) over (partition by db_id,inst_id,metric_name order by bucket_ts) d
+  from fd_metric_rollup) where d < interval '30' second group by metric_name;
+select metric_name, count(*) n from fd_metric_rollup group by metric_name order by n;
+SQL
+~~~
+
+Pass criteria: no near-duplicates, equal row counts per metric, and gaps only where a
+component was deliberately stopped.
+
+## Troubleshooting (sink and collector)
+
+| Symptom | Cause and fix |
+|---|---|
+| Collector "no rows" in a pluggable DB | `v$sysmetric` is empty in a PDB. Use `gv$con_sysmetric` group 18 (`grant select on sys.gv_$con_sysmetric to fleetdiag`). The collector picks the right view automatically. |
+| Sink log shows no new "sink started" | Check `sink/run/sink.err` and that `ORACLE_PASSWORD` is exported in the same shell. |
+| Replay test "passes" instantly | Kafka commands failed silently (zsh word splitting, see above). Check that `--describe` printed a table. |
+| `ORA-01031` granting SYS views | Connect as SYSDBA inside the PDB (`alter session set container = FREEPDB1`). |
