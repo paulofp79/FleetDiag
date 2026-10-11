@@ -10,6 +10,8 @@ Written on 2026-10-11 on macOS with Apple Silicon (arm64) and Docker Desktop. Co
 | Oracle Free container | verified: starts, version banner returned |
 | `gv$sysmetric` check | pending: confirm `group_id` for 60 s metrics |
 | Python environment | commands below, not yet confirmed |
+| Schema in the local Oracle | verified: 7 tables, 4 views, no invalid objects |
+| Collector | written; first run and Kafka check pending |
 
 ## Prerequisites
 
@@ -161,7 +163,120 @@ pip install -r collector/requirements.txt
 python -c "import oracledb, confluent_kafka; print('oracledb', oracledb.__version__, '| confluent-kafka', confluent_kafka.version()[0])"
 ```
 
+## 5. Load the schema into the local database
+
+Grants first. `SYSTEM` can grant the general privileges but not select on `SYS` views, so the second step uses `SYSDBA`:
+
+```bash
+cd deploy
+PW="$(grep ORACLE_SOURCE_PWD .env | cut -d= -f2)"
+
+docker compose exec -T oracle-source sqlplus -s system/"$PW"@//localhost/FREEPDB1 <<'SQL'
+GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE ROLE, UNLIMITED TABLESPACE TO fleetdiag;
+SQL
+
+docker compose exec -T oracle-source sqlplus -s / as sysdba <<'SQL'
+ALTER SESSION SET CONTAINER = FREEPDB1;
+GRANT SELECT ON sys.gv_$sysmetric TO fleetdiag;
+GRANT SELECT ON sys.gv_$system_event TO fleetdiag;
+SQL
+```
+
+Then the schema and views, run as `fleetdiag`:
+
+```bash
+docker compose exec -T oracle-source sqlplus -s fleetdiag/"$PW"@//localhost/FREEPDB1 < ../sql/001_schema.sql
+docker compose exec -T oracle-source sqlplus -s fleetdiag/"$PW"@//localhost/FREEPDB1 < ../sql/002_views.sql
+docker compose exec -T oracle-source sqlplus -s fleetdiag/"$PW"@//localhost/FREEPDB1 <<'SQL'
+SELECT object_type, COUNT(*) FROM user_objects GROUP BY object_type ORDER BY 1;
+SELECT object_name, object_type FROM user_objects WHERE status <> 'VALID';
+SQL
+```
+
+Seen on 2026-10-11: INDEX 34, INDEX PARTITION 4, LOB 15, LOB PARTITION 2, SEQUENCE 4, TABLE 11, TABLE PARTITION 4, VIEW 4, and no invalid objects. The 11 tables are the 7 FleetDiag tables plus, most likely, internal tables behind the two vector indexes. The DDL ran without errors on Oracle AI Database 26ai Free 23.26.3.
+
+### Schema troubleshooting
+
+- **`ORA-01031: insufficient privileges` on `GRANT SELECT ON sys.gv_$...` as SYSTEM.** SYSTEM does not hold those views with grant option. Run the grants as `SYSDBA`, as above.
+- **Start over.** Run `DROP USER fleetdiag CASCADE;` as SYSTEM, then recreate the container with `docker compose down -v` and `docker compose up -d oracle-source`. The `down -v` removes the data volume too.
+
+## 6. Collector (M0)
+
+`collector/collector.py` reads the 60-second system metrics from `GV$SYSMETRIC` every 15 seconds and publishes one JSON event per metric per interval to `ora.metric.raw.v1`.
+
+- Only metrics in `collector/config/metrics.yaml` are published.
+- Events are validated against `schemas/metric_sample.v1.json` before sending.
+- A value already published for the same interval is skipped. The state is in memory, so a restart can resend one interval. The sink will be idempotent.
+- Database times are converted to UTC using the offset between `SYSDATE` and the UTC time.
+- It warns if the query returns no rows (check `group_id` in `collector/queries/sysmetric_60s.sql`) and lists allow-listed metrics that don't exist in the database.
+
+Settings come from environment variables:
+
+| Variable | Default |
+|---|---|
+| `ORACLE_PASSWORD` | required |
+| `ORACLE_USER` | `fleetdiag` |
+| `ORACLE_DSN` | `localhost:1521/FREEPDB1` |
+| `KAFKA_BOOTSTRAP` | `localhost:9092` |
+| `KAFKA_TOPIC` | `ora.metric.raw.v1` |
+| `FLEET` / `DB_UNIQUE_NAME` | `local` / `FREE` |
+| `POLL_SEC` | `15` |
+
+Run it (the venv from section 4 must exist):
+
+```bash
+cd "$HOME/Documents/ClaudeCode/FleetDiag"
+source collector/.venv/bin/activate
+export ORACLE_PASSWORD="$(grep ORACLE_SOURCE_PWD deploy/.env | cut -d= -f2)"
+python collector/collector.py
+```
+
+The `export` reads the password from `deploy/.env` into the current terminal only. Stop the collector with Ctrl+C.
+
+Check the messages in Kafka (second terminal):
+
+```bash
+cd deploy
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:19092 --topic ora.metric.raw.v1 --from-beginning --max-messages 3 --timeout-ms 15000
+docker compose exec -T kafka /opt/kafka/bin/kafka-run-class.sh kafka.tools.GetOffsetShell --bootstrap-server kafka:19092 --topic ora.metric.raw.v1
+```
+
+Status: the first run and the Kafka check have not been confirmed yet.
+
+### Collector troubleshooting
+
+- **`source: no such file or directory: collector/.venv/bin/activate`.** The venv was never created. Do section 4 first.
+- **"query returned no rows".** The `group_id` for 60-second metrics differs. List the groups with `SELECT group_id, COUNT(*) FROM gv$sysmetric GROUP BY group_id` as `fleetdiag` and update `queries/sysmetric_60s.sql`.
+- **"allow-listed metrics not found".** Metric names vary by release. Trim `config/metrics.yaml` to names present in `V$METRICNAME`.
+
+## 7. Generating test load
+
+An idle database gives flat metrics, which cannot tell a working pipeline from a stuck one. Run a short CPU load while the collector is running:
+
+```bash
+cd deploy
+PW="$(grep ORACLE_SOURCE_PWD .env | cut -d= -f2)"
+docker compose exec -T oracle-source sqlplus -s fleetdiag/"$PW"@//localhost/FREEPDB1 <<'SQL'
+DECLARE
+  t0 TIMESTAMP := SYSTIMESTAMP;
+  n  NUMBER := 1;
+BEGIN
+  WHILE SYSTIMESTAMP - t0 < INTERVAL '120' SECOND LOOP
+    FOR i IN 1..200000 LOOP
+      n := MOD(n * i + SQRT(i), 1000003);
+    END LOOP;
+  END LOOP;
+END;
+/
+SQL
+```
+
+This burns one CPU for about 2 minutes. `Average Active Sessions` and the CPU metrics should rise during that time and fall afterwards.
+
+Swingbench is a good next step for a realistic OLTP load. Limits of the Free container: 2 CPU threads, 2 GB RAM, and a single instance, so global cache contention cannot be tested there. Use DBStress on a RAC for that.
+
 ## Next
 
-1. Grant the `fleetdiag` user what the schema needs and load `sql/001_schema.sql` and `sql/002_views.sql` into the local database.
-2. Write the collector, then the sink.
+1. Confirm the collector run and the Kafka messages.
+2. Write the sink: consume `ora.metric.raw.v1` and MERGE into `fd_metric_rollup` (M0 only; Flink takes over the rollup in M1).
+3. Add Flink containers (expect to need `JAVA_TOOL_OPTIONS` there too).
