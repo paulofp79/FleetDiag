@@ -12,6 +12,10 @@ Non-goals for v1: replacing Cloud Control, automatic remediation, tuning advice,
 
 ## Overview
 
+![FleetDiag architecture](img/architecture.svg)
+
+The same flow as editable Mermaid source:
+
 ```mermaid
 flowchart LR
   subgraph SRC["Monitored databases"]
