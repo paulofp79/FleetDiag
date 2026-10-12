@@ -670,3 +670,23 @@ from fd_baseline b, json_table(b.slots, '$[*]' columns (slot for ordinality,
      med number path '$.med', mad number path '$.mad', n number path '$.n')) jt
 where b.metric_name = 'Redo Generated Per Sec' and jt.med is not null order by 1;
 ~~~
+
+### Baseline topic
+
+After the MERGE, `baseline.py` validates each series against `schemas/baseline.v1.json` and
+publishes it to `ora.baseline.v1` (compacted, 6 partitions), key
+`fleet/db_unique_name/inst_id/metric_name`. `--no-publish` skips Kafka. Create the topic before
+the first run, otherwise auto-create makes it without compaction:
+
+~~~bash
+(cd deploy && ./create-topics.sh)      # --if-not-exists, safe to re-run
+docker compose -f deploy/docker-compose.yml exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:19092 --describe --topic ora.baseline.v1   # cleanup.policy=compact
+docker compose -f deploy/docker-compose.yml exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:19092 --topic ora.baseline.v1 --from-beginning \
+  --property print.key=true --timeout-ms 10000 | cut -c1-200
+~~~
+
+Each run adds one message per series. Older ones stay readable until Kafka compacts closed
+segments; consumers keep the newest message per key. The consumer ends with a
+`TimeoutException`, which is how `--timeout-ms` stops it.

@@ -70,7 +70,7 @@ flowchart LR
 | `ora.wait.rollup.v1` | Flink | sink | `db_id/inst_id` | AAS by wait class and event |
 | `ora.anomaly.v1` | Flink | sink, correlator | `db_id` | deterministic `anomaly_key` |
 | `ora.incident.v1` | Flink | sink, agent | `db_id` | deterministic `incident_key`, upserts |
-| `ora.baseline.v1` | Spark | Flink (broadcast state) | `db_id/inst_id/metric` | compacted, one message per series |
+| `ora.baseline.v1` | Spark | Flink (broadcast state) | `fleet/db_unique_name/inst_id/metric` | compacted, one message per series, schema `baseline.v1` |
 
 Delivery is at-least-once everywhere. Idempotence comes from deterministic keys and MERGE in the sink.
 

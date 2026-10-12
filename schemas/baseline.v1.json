@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "baseline.v1",
+  "description": "Seasonal baseline for one series (database, instance, metric). Topic: ora.baseline.v1 (compacted, key fleet/db_unique_name/inst_id/metric_name). slots has 168 entries, hour of week in UTC, 0 = Monday 00:00. A null slot has too few samples; scoring uses its EWMA fallback there.",
+  "type": "object",
+  "required": ["schema", "fleet", "db_unique_name", "inst_id", "metric_name", "slot_tz", "weeks_used", "min_samples", "lookback_days", "computed_at", "slots"],
+  "properties": {
+    "schema": { "const": "baseline.v1" },
+    "fleet": { "type": "string" },
+    "db_unique_name": { "type": "string" },
+    "db_id": { "type": "integer" },
+    "inst_id": { "type": "integer", "minimum": 1 },
+    "metric_name": { "type": "string" },
+    "slot_tz": { "const": "UTC" },
+    "weeks_used": { "type": "integer", "minimum": 0 },
+    "min_samples": { "type": "integer", "minimum": 1 },
+    "lookback_days": { "type": "integer", "minimum": 1 },
+    "computed_at": { "type": "string", "format": "date-time" },
+    "slots": {
+      "type": "array",
+      "minItems": 168,
+      "maxItems": 168,
+      "items": {
+        "oneOf": [
+          { "type": "null" },
+          {
+            "type": "object",
+            "required": ["med", "mad", "n"],
+            "properties": {
+              "med": { "type": "number" },
+              "mad": { "type": "number", "minimum": 0 },
+              "n": { "type": "integer", "minimum": 1 }
+            },
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  },
+  "additionalProperties": false
+}

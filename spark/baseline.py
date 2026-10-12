@@ -8,12 +8,19 @@ fd_baseline.slots is a JSON array of 168 entries, each {"med": x, "mad": y, "n":
 when the slot has fewer than --min-samples values. Scoring uses its EWMA fallback for null
 slots and applies the MAD floor itself, so raw MAD is stored here.
 
+Each series is also published to the compacted topic ora.baseline.v1 (schemas/baseline.v1.json),
+key fleet/db_unique_name/inst_id/metric_name, the same identity the raw metric stream carries.
+Flink scoring loads it as broadcast state. The MERGE runs first, then the publish.
+
 Usage (spark venv active, ORACLE_PASSWORD exported):
-    python spark/baseline.py [--lookback-days 56] [--min-samples 30] [--dry-run]
+    python spark/baseline.py [--lookback-days 56] [--min-samples 30] [--dry-run] [--no-publish]
 """
 import argparse
+import json
 import os
 import sys
+from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 from pyspark.sql import SparkSession, Window, functions as F
@@ -22,6 +29,9 @@ ROOT = Path(__file__).resolve().parent
 JAR = ROOT / "jars" / "ojdbc11.jar"
 DSN = os.getenv("ORACLE_DSN", "localhost:1521/FREEPDB1")
 USER = os.getenv("ORACLE_USER", "fleetdiag")
+BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+TOPIC = os.getenv("BASELINE_TOPIC", "ora.baseline.v1")
+SCHEMA_FILE = ROOT.parent / "schemas" / "baseline.v1.json"
 SLOTS = 168
 KEYS = ["db_id", "inst_id", "metric_name"]
 
@@ -30,9 +40,9 @@ merge into fd_baseline t
 using (select :db_id db_id, :inst_id inst_id, :metric_name metric_name from dual) s
 on (t.db_id = s.db_id and t.inst_id = s.inst_id and t.metric_name = s.metric_name)
 when matched then update set
-  t.weeks_used = :weeks_used, t.slots = :slots, t.computed_at = sys_extract_utc(systimestamp)
+  t.weeks_used = :weeks_used, t.slots = :slots, t.computed_at = :computed_at
 when not matched then insert (db_id, inst_id, metric_name, weeks_used, computed_at, slots)
-  values (:db_id, :inst_id, :metric_name, :weeks_used, sys_extract_utc(systimestamp), :slots)
+  values (:db_id, :inst_id, :metric_name, :weeks_used, :computed_at, :slots)
 """
 
 
@@ -41,6 +51,7 @@ def parse_args():
     p.add_argument("--lookback-days", type=int, default=56)
     p.add_argument("--min-samples", type=int, default=30)
     p.add_argument("--dry-run", action="store_true", help="compute and print, do not write")
+    p.add_argument("--no-publish", action="store_true", help="MERGE into fd_baseline, skip Kafka")
     return p.parse_args()
 
 
@@ -57,13 +68,8 @@ def spark_session():
     )
 
 
-def read_rollups(spark, lookback_days):
-    query = (
-        "select db_id, inst_id, metric_name, bucket_ts, val_avg from fd_metric_rollup "
-        "where bucket_sec = 60 and val_avg is not null "
-        f"and bucket_ts >= sys_extract_utc(systimestamp) - numtodsinterval({int(lookback_days)}, 'DAY')"
-    )
-    df = (
+def jdbc(spark, query):
+    return (
         spark.read.format("jdbc")
         .option("url", f"jdbc:oracle:thin:@//{DSN}")
         .option("user", USER)
@@ -73,6 +79,21 @@ def read_rollups(spark, lookback_days):
         .option("fetchsize", "10000")
         .load()
     )
+
+
+def read_databases(spark):
+    df = jdbc(spark, "select db_id, fleet, db_unique_name from fd_database")
+    return df.select(F.col("DB_ID").cast("long").alias("db_id"),
+                     F.col("FLEET").alias("fleet"),
+                     F.col("DB_UNIQUE_NAME").alias("db_unique_name"))
+
+
+def read_rollups(spark, lookback_days):
+    df = jdbc(spark, (
+        "select db_id, inst_id, metric_name, bucket_ts, val_avg from fd_metric_rollup "
+        "where bucket_sec = 60 and val_avg is not null "
+        f"and bucket_ts >= sys_extract_utc(systimestamp) - numtodsinterval({int(lookback_days)}, 'DAY')"
+    ))
     # Oracle NUMBER comes back as decimal; lower-case names to match KEYS.
     return df.select(
         F.col("DB_ID").cast("long").alias("db_id"),
@@ -113,26 +134,67 @@ def compute(df, min_samples):
     return filled.select(*KEYS, "weeks_used", "filled", F.to_json(dense).alias("slots_json"))
 
 
-def write_partition(rows):
-    import json
+def write_partition(rows, computed_at, min_samples, lookback_days, publish):
     import oracledb
 
     rows = list(rows)
     if not rows:
         return
+    slots = {id(r): json.loads(r.slots_json) for r in rows}
+
     conn = oracledb.connect(user=USER, password=os.environ["ORACLE_PASSWORD"], dsn=DSN)
     try:
         cur = conn.cursor()
         cur.setinputsizes(slots=oracledb.DB_TYPE_JSON)
-        batch = [
+        cur.executemany(MERGE_SQL, [
             {"db_id": r.db_id, "inst_id": r.inst_id, "metric_name": r.metric_name,
-             "weeks_used": r.weeks_used, "slots": json.loads(r.slots_json)}
+             "weeks_used": r.weeks_used, "computed_at": computed_at.replace(tzinfo=None),
+             "slots": slots[id(r)]}
             for r in rows
-        ]
-        cur.executemany(MERGE_SQL, batch)
+        ])
         conn.commit()
     finally:
         conn.close()
+
+    if not publish:
+        return
+
+    from confluent_kafka import Producer
+    from jsonschema import Draft202012Validator
+
+    validator = Draft202012Validator(json.loads(SCHEMA_FILE.read_text()))
+    producer = Producer({"bootstrap.servers": BOOTSTRAP, "client.id": "fd-baseline",
+                         "enable.idempotence": True, "acks": "all"})
+    failed = []
+
+    def on_delivery(err, msg):
+        if err is not None:
+            failed.append(f"{msg.key()}: {err}")
+
+    for r in rows:
+        event = {
+            "schema": "baseline.v1",
+            "fleet": r.fleet,
+            "db_unique_name": r.db_unique_name,
+            "db_id": r.db_id,
+            "inst_id": r.inst_id,
+            "metric_name": r.metric_name,
+            "slot_tz": "UTC",
+            "weeks_used": r.weeks_used,
+            "min_samples": min_samples,
+            "lookback_days": lookback_days,
+            "computed_at": computed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "slots": slots[id(r)],
+        }
+        err = next(validator.iter_errors(event), None)
+        if err is not None:
+            raise ValueError(f"invalid baseline for {r.metric_name}: {err.message}")
+        key = f"{r.fleet}/{r.db_unique_name}/{r.inst_id}/{r.metric_name}"
+        producer.produce(TOPIC, key=key, value=json.dumps(event), on_delivery=on_delivery)
+        producer.poll(0)
+    left = producer.flush(30)
+    if left or failed:
+        raise RuntimeError(f"kafka publish failed: {left} undelivered, errors={failed[:3]}")
 
 
 def main():
@@ -149,15 +211,21 @@ def main():
     print(f"input rows: {raw.count()}  lookback_days={args.lookback_days}  "
           f"min_samples={args.min_samples}")
 
-    out = compute(raw, args.min_samples).cache()
+    out = compute(raw, args.min_samples).join(read_databases(spark), "db_id").cache()
     print(f"series: {out.count()}")
-    out.select(*KEYS, "weeks_used", "filled").orderBy(*KEYS).show(50, truncate=False)
+    out.select("fleet", "db_unique_name", *KEYS, "weeks_used", "filled") \
+       .orderBy(*KEYS).show(50, truncate=False)
 
     if args.dry_run:
         print("dry run: nothing written")
     else:
-        out.select(*KEYS, "weeks_used", "slots_json").foreachPartition(write_partition)
-        print("fd_baseline merged")
+        computed_at = datetime.now(timezone.utc).replace(microsecond=0)
+        publish = not args.no_publish
+        out.foreachPartition(partial(write_partition, computed_at=computed_at,
+                                     min_samples=args.min_samples,
+                                     lookback_days=args.lookback_days, publish=publish))
+        print(f"fd_baseline merged, computed_at={computed_at:%Y-%m-%d %H:%M:%S} UTC"
+              + (f", published to {TOPIC}" if publish else ", not published"))
 
     spark.stop()
 

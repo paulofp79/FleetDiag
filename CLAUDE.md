@@ -41,9 +41,11 @@ docs/ROADMAP.md, docs/INSTALL.md. Read them before changing design.
 - BUG (fixed 2026-10-11: collector re-picks view on empty poll and logs STALL): the collector picks its query view once at startup. After an Oracle restart the PDB view was still empty, so it fell back to the empty root view and published nothing for ~40 min while still "running". Fix needed: re-run pick_query when a poll returns no rows (try/except oracledb.Error), and log ERROR / exit after N consecutive empty polls so a silent stall cannot happen.
 - The 24 h M0 run was restarted after the fix; start time is the last line of sink/run/m0_start.txt. Restart it after the collector fix: write start time with `date -u +"%Y-%m-%d %H:%M:%S" | tee sink/run/m0_start.txt`, keep the Mac awake (nohup caffeinate -dimsu), then run scripts/m0_check.sh (filters bucket_sec = 60). Pass: no gaps over 90 s, no near-duplicates under 30 s, equal rows per metric.
 - M1 step 1 done: Flink 5-min rollup job verified (Flink avg equals SQL average of 60 s rows). rollup_sink.py writes bucket_sec=300 rows.
+- M1 step 2 done (2026-10-12): spark/baseline.py (venv spark/.venv, PySpark 4.2, Java 23 OK) computes median/MAD per series per UTC hour-of-week (slot 0 = Mon 00:00), MERGEs fd_baseline and publishes ora.baseline.v1 (compacted, key fleet/db_unique_name/inst_id/metric_name, schemas/baseline.v1.json). Slots under 30 samples are null.
+- M0 window since 19:45:26 UTC had one missing minute right after the start (cause not checked yet).
 
 ## Next
-1. Fix collector stall (above), restart the 24 h run.
-2. M1: Spark seasonal baselines (median/MAD per series per hour-of-week, 168 slots), robust z-score, EWMA fallback, then Flink scoring and RAC rules, then incident correlator.
+1. Finish the 24 h M0 run (scripts/m0_check.sh); explain or reset after the early gap.
+2. M1: make the Flink job restartable (checkpoints, resubmit script), then Flink scoring (robust z-score vs ora.baseline.v1, MAD floor, EWMA fallback) -> ora.anomaly.v1 -> fd_anomaly sink, then exit tests. RAC rules and incident correlator are M2.
 3. Later: collector backfill from gv$con_sysmetric_history, ADB (cloud) testing (open: ATP vs ADW, wallet vs TLS, whether ADB exposes group 18).
 4. Open decisions: D6 Iceberg write path, D8 license, D9 embedding dimension.
