@@ -690,3 +690,32 @@ docker compose -f deploy/docker-compose.yml exec -T kafka /opt/kafka/bin/kafka-c
 Each run adds one message per series. Older ones stay readable until Kafka compacts closed
 segments; consumers keep the newest message per key. The consumer ends with a
 `TimeoutException`, which is how `--timeout-ms` stops it.
+
+## Flink restarts and checkpoints
+
+`rollup_5m.sql` checkpoints every 60 s into `flink/checkpoints/<job id>/chk-N` (mounted in both
+Flink containers, git-ignored, last 3 kept, retained on cancel and crash). The job has no HA:
+when the Flink containers restart, the job is gone and must be resubmitted. Always submit with
+the script, never with `sql-client.sh` directly:
+
+~~~bash
+./scripts/flink-submit.sh            # no-op if running; else resume from newest checkpoint
+./scripts/flink-submit.sh --fresh    # ignore checkpoints, replay from the earliest offset
+~~~
+
+Resuming keeps the open windows and Kafka offsets, so no partial 5 minute window is published
+after a restart. A fresh start replays everything and republishes every window; the rollup sink
+MERGEs them, so it is correct but slower. If `rollup_5m.sql` changes in a way that changes the
+job graph, restoring may fail; use `--fresh` then.
+
+Restart test (reference run 2026-10-12): `dcf restart flink-jobmanager flink-taskmanager`, then
+the script printed `resuming from .../chk-1` and the job REST API showed
+`"restored": {"id": 1, ...}`:
+
+~~~bash
+curl -s localhost:8081/jobs/<JOB_ID>/checkpoints | python3 -m json.tool | grep -A8 '"restored"'
+~~~
+
+`table.exec.source.idle-timeout` is 2 minutes, so a Kafka partition without data does not
+hold the watermark back. Keep `ora.metric.raw.v1` at 1 partition locally: one database means
+one key, and the other partitions would stay empty.

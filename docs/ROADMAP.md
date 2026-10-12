@@ -47,7 +47,7 @@ This is the part nobody else will have.
 - [x] Spark baseline job: median/MAD per series per hour-of-week (168 UTC slots) into fd_baseline
       (spark/baseline.py), slots under min_samples stored as null; EWMA fallback lives in Flink scoring
 - [x] Baseline topic (ora.baseline.v1, compacted) and schemas/baseline.v1.json, published by baseline.py
-- [ ] Make the Flink job restartable (checkpoints, resubmit script that checks for a running job)
+- [x] Make the Flink job restartable: checkpoints every 60 s in flink/checkpoints, scripts/flink-submit.sh resumes from the latest one
 - [ ] Flink scoring: robust z-score vs baseline (EWMA fallback) to ora.anomaly.v1
 - [ ] Anomaly sink into fd_anomaly
 - [ ] 1 hour rollup (low priority)
