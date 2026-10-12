@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "anomaly.v1",
+  "description": "One statistical anomaly. Topic: ora.anomaly.v1, key fleet/db_unique_name/inst_id. The same anomaly_key is re-published while the anomaly grows (window_end, peak score); consumers upsert on anomaly_key into fd_anomaly.",
+  "type": "object",
+  "required": ["schema", "anomaly_key", "fleet", "db_unique_name", "inst_id", "kind", "subject", "window_start", "window_end", "score", "severity"],
+  "properties": {
+    "schema": { "const": "anomaly.v1" },
+    "anomaly_key": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "fleet": { "type": "string" },
+    "db_unique_name": { "type": "string" },
+    "inst_id": { "type": "integer", "minimum": 1 },
+    "kind": { "enum": ["METRIC_DEVIATION", "WAIT_CLASS_SHIFT", "GC_LATENCY", "GC_SKEW", "BLOCKER_CHAIN"] },
+    "subject": { "type": "string" },
+    "window_start": { "type": "string", "format": "date-time" },
+    "window_end": { "type": "string", "format": "date-time" },
+    "observed_val": { "type": ["number", "null"] },
+    "baseline_val": { "type": ["number", "null"] },
+    "score": { "type": "number", "minimum": 0 },
+    "severity": { "enum": ["INFO", "WARNING", "CRITICAL"] },
+    "evidence": { "type": "object" }
+  },
+  "additionalProperties": false
+}

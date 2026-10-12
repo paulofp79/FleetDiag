@@ -18,3 +18,4 @@ spark/jars/*.jar
 spark/.venv/
 flink/checkpoints/
 flink/sql/_submit.sql
+flink-jobs/target/
