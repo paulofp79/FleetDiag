@@ -5,8 +5,10 @@ services:
     volumes:
       - ../flink/extra:/opt/flink/extra
       - ../flink/sql:/opt/flink/sql
+      - ../flink/checkpoints:/opt/flink/checkpoints
   flink-taskmanager:
     environment:
       JAVA_TOOL_OPTIONS: "-XX:UseSVE=0"
     volumes:
       - ../flink/extra:/opt/flink/extra
+      - ../flink/checkpoints:/opt/flink/checkpoints

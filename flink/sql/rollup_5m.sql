@@ -1,6 +1,14 @@
 SET 'sql-client.execution.result-mode' = 'tableau';
 SET 'table.local-time-zone' = 'UTC';
 SET 'pipeline.name' = 'fleetdiag-rollup-5m';
+-- Checkpoints every minute to flink/checkpoints (mounted on both containers). Kept after
+-- cancel or a container crash so scripts/flink-submit.sh can resume from the latest one.
+SET 'execution.checkpointing.interval' = '60 s';
+SET 'state.checkpoints.dir' = 'file:///opt/flink/checkpoints';
+SET 'execution.checkpointing.externalized-checkpoint-retention' = 'RETAIN_ON_CANCELLATION';
+SET 'execution.checkpointing.num-retained' = '3';
+-- A Kafka partition with no data would hold the watermark back and no window would close.
+SET 'table.exec.source.idle-timeout' = '2 min';
 
 CREATE TABLE metric_raw (
   fleet STRING,
