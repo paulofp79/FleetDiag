@@ -635,3 +635,38 @@ Result on the reference run: values equal in every full window.
 
 Note: any query over `fd_metric_rollup` that checks gaps or duplicates must filter on
 `bucket_sec`, otherwise 60 s and 300 s rows mix. `scripts/m0_check.sh` already does.
+
+## Spark (M1): seasonal baselines
+
+Spark runs locally from its own venv (`spark/.venv`, PySpark 4.2) so it does not touch the
+collector venv. The Oracle JDBC driver is downloaded, not stored in git. Java 23 works with
+PySpark 4.2 (warning `Using incubator modules` is harmless).
+
+~~~bash
+python3 -m venv spark/.venv
+source spark/.venv/bin/activate
+pip install -r spark/requirements.txt
+mkdir -p spark/jars
+curl -fL -o spark/jars/ojdbc11.jar \
+  https://repo1.maven.org/maven2/com/oracle/database/jdbc/ojdbc11/23.5.0.24.07/ojdbc11-23.5.0.24.07.jar
+export ORACLE_PASSWORD="$(grep ORACLE_SOURCE_PWD deploy/.env | cut -d= -f2)"
+python spark/read_check.py            # JDBC read of the 60 s rows, counts per metric
+python spark/baseline.py --dry-run    # compute only
+python spark/baseline.py              # MERGE into fd_baseline
+~~~
+
+`baseline.py` reads the 60 s rows of the last 56 days (`--lookback-days`), groups them by series
+and hour of week in UTC (slot 0 = Monday 00:00, 167 = Sunday 23:00) and stores median, MAD and
+sample count per slot as a 168-entry JSON array in `fd_baseline.slots`. A slot with fewer than
+`--min-samples` (30) values is `null`; scoring falls back to EWMA there. `weeks_used` is the
+largest number of weekly observations behind any filled slot. Re-running is idempotent (MERGE
+on the primary key).
+
+Check:
+
+~~~sql
+select jt.slot - 1 slot, jt.med, jt.mad, jt.n
+from fd_baseline b, json_table(b.slots, '$[*]' columns (slot for ordinality,
+     med number path '$.med', mad number path '$.mad', n number path '$.n')) jt
+where b.metric_name = 'Redo Generated Per Sec' and jt.med is not null order by 1;
+~~~

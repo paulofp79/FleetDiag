@@ -94,27 +94,23 @@ def compute(df, min_samples):
           .groupBy(*slot_keys)
           .agg(F.first("med").alias("med"),
                F.median(F.abs(F.col("val") - F.col("med"))).alias("mad"),
-               F.count("*").alias("n"))
+               F.count("*").alias("n"),
+               # how many weekly observations this slot has (date_trunc week starts Monday)
+               F.countDistinct(F.date_trunc("week", "bucket_ts")).alias("wk"))
     )
 
-    weeks = df.groupBy(*KEYS).agg(
-        F.countDistinct(F.date_trunc("week", "bucket_ts")).alias("weeks_used"))
-
-    entry = F.when(
-        F.col("n") >= min_samples,
-        F.struct(F.round("med", 6).alias("med"), F.round("mad", 6).alias("mad"), "n"),
-    )
+    ok = F.col("n") >= min_samples
+    entry = F.when(ok, F.struct(F.round("med", 6).alias("med"), F.round("mad", 6).alias("mad"), "n"))
     filled = (
         stats.groupBy(*KEYS)
              .agg(F.map_from_entries(F.collect_list(F.struct("slot", entry.alias("e")))).alias("m"),
-                  F.sum(F.when(F.col("n") >= min_samples, 1).otherwise(0)).alias("filled"))
+                  F.sum(F.when(ok, 1).otherwise(0)).alias("filled"),
+                  # weeks_used = most weekly observations behind any filled slot
+                  F.coalesce(F.max(F.when(ok, F.col("wk"))), F.lit(0)).alias("weeks_used"))
     )
     # Expand the slot map into a dense 168-entry array (null where missing or too few samples).
     dense = F.transform(F.sequence(F.lit(0), F.lit(SLOTS - 1)), lambda s: F.col("m")[s])
-    return (
-        filled.join(weeks, KEYS)
-              .select(*KEYS, "weeks_used", "filled", F.to_json(dense).alias("slots_json"))
-    )
+    return filled.select(*KEYS, "weeks_used", "filled", F.to_json(dense).alias("slots_json"))
 
 
 def write_partition(rows):

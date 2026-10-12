@@ -44,8 +44,8 @@ This is the part nobody else will have.
 - [x] Rollup sink into fd_metric_rollup (bucket_sec = 300)
 - [x] Collector stall fix and Oracle restart test
 - [x] Spark environment: separate venv, ojdbc jar, read fd_metric_rollup over JDBC (spark/read_check.py)
-- [ ] Spark baseline job: median/MAD per series per hour-of-week (168 slots) into fd_baseline,
-      with min_samples per slot and EWMA fallback for slots without enough data
+- [x] Spark baseline job: median/MAD per series per hour-of-week (168 UTC slots) into fd_baseline
+      (spark/baseline.py), slots under min_samples stored as null; EWMA fallback lives in Flink scoring
 - [ ] Baseline topic (ora.baseline.v1) and JSON schema in schemas/
 - [ ] Make the Flink job restartable (checkpoints, resubmit script that checks for a running job)
 - [ ] Flink scoring: robust z-score vs baseline (EWMA fallback) to ora.anomaly.v1
